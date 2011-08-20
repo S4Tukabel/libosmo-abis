@@ -1,6 +1,6 @@
 /* OpenBSC Abis input driver for mISDNuser */
 
-/* (C) 2008-2009 by Harald Welte <laforge@gnumonks.org>
+/* (C) 2008-2011 by Harald Welte <laforge@gnumonks.org>
  * (C) 2009 by Holger Hans Peter Freyther <zecke@selfish.org>
  *
  * All Rights Reserved
@@ -46,9 +46,13 @@
 #include <osmocom/core/msgb.h>
 #include <osmocom/core/logging.h>
 #include <osmocom/abis/e1_input.h>
+#include <osmocom/abis/lapd.h>
 #include <osmocom/core/talloc.h>
 
 #define TS1_ALLOC_SIZE	300
+
+/* FIXME: find a way to configure this, maybe even per line */
+static int use_userspace_lapd = 0;
 
 const struct value_string prim_names[] = {
 	{ PH_CONTROL_IND, "PH_CONTROL_IND" },
@@ -145,7 +149,13 @@ static int handle_ts1_read(struct osmo_fd *bfd)
 	case DL_UNITDATA_IND:
 		msg->l2h = msg->data + MISDN_HEADER_LEN;
 		DEBUGP(DLMI, "RX: %s\n", osmo_hexdump(msgb_l2(msg), ret - MISDN_HEADER_LEN));
-		ret = e1inp_rx_ts(e1i_ts, msg, l2addr.tei, l2addr.sapi);
+		if (use_userspace_lapd) {
+			/* remove the Misdn Header */
+			msgb_pull(msg, MISDN_HEADER_LEN);
+			/* hand into the LAPD code */
+			ret = e1inp_rx_ts_lapd(e1i_ts, msg);
+		} else
+			ret = e1inp_rx_ts(e1i_ts, msg, l2addr.tei, l2addr.sapi);
 		break;
 	case PH_ACTIVATE_IND:
 		DEBUGP(DLMI, "PH_ACTIVATE_IND: channel(%d) sapi(%d) tei(%d)\n",
@@ -203,26 +213,35 @@ static int handle_ts1_write(struct osmo_fd *bfd)
 		return 0;
 	}
 
-	l2_data = msg->data;
+	if (use_userspace_lapd) {
+		DEBUGP(DLMI, "TX %u/%u/%u: %s\n",
+			line->num, sign_link->tei, sign_link->sapi,
+			osmo_hexdump(msg->data, msg->len));
+		lapd_transmit(e1i_ts->lapd, sign_link->tei,
+				sign_link->sapi, msg->data, msg->len);
+	} else {
+		l2_data = msg->data;
 
-	/* prepend the mISDNhead */
-	hh = (struct mISDNhead *) msgb_push(msg, sizeof(*hh));
-	hh->prim = DL_DATA_REQ;
+		/* prepend the mISDNhead */
+		hh = (struct mISDNhead *) msgb_push(msg, sizeof(*hh));
+		hh->prim = DL_DATA_REQ;
 
-	DEBUGP(DLMI, "TX channel(%d) TEI(%d) SAPI(%d): %s\n",
-		sign_link->driver.misdn.channel, sign_link->tei,
-		sign_link->sapi, osmo_hexdump(l2_data, msg->len - MISDN_HEADER_LEN));
+		DEBUGP(DLMI, "TX channel(%d) TEI(%d) SAPI(%d): %s\n",
+			sign_link->driver.misdn.channel, sign_link->tei,
+			sign_link->sapi, osmo_hexdump(l2_data, msg->len - MISDN_HEADER_LEN));
 
-	/* construct the sockaddr */
-	sa.family = AF_ISDN;
-	sa.sapi = sign_link->sapi;
-	sa.dev = sign_link->tei;
-	sa.channel = sign_link->driver.misdn.channel;
+		/* construct the sockaddr */
+		sa.family = AF_ISDN;
+		sa.sapi = sign_link->sapi;
+		sa.dev = sign_link->tei;
+		sa.channel = sign_link->driver.misdn.channel;
 
-	ret = sendto(bfd->fd, msg->data, msg->len, 0,
-		     (struct sockaddr *)&sa, sizeof(sa));
-	if (ret < 0)
-		fprintf(stderr, "%s sendto failed %d\n", __func__, ret);
+		ret = sendto(bfd->fd, msg->data, msg->len, 0,
+			     (struct sockaddr *)&sa, sizeof(sa));
+		if (ret < 0)
+			fprintf(stderr, "%s sendto failed %d\n", __func__, ret);
+	}
+
 	msgb_free(msg);
 
 	/* set tx delay timer for next event */
@@ -231,6 +250,20 @@ static int handle_ts1_write(struct osmo_fd *bfd)
 	osmo_timer_schedule(&e1i_ts->sign.tx_timer, 0, e1i_ts->sign.delay);
 
 	return ret;
+}
+
+/*! \brief call-back from LAPD code, called when it wants to Tx data */
+static void misdn_write_msg(uint8_t *data, int len, void *cbdata)
+{
+	struct osmo_fd *bfd = cbdata;
+	struct e1inp_line *line = bfd->data;
+	unsigned int ts_nr = bfd->priv_nr;
+	struct e1inp_ts *e1i_ts = &line->ts[ts_nr-1];
+	int ret;
+
+	ret = write(bfd->fd, data, len);
+	if (ret < 0)
+		LOGP(DLMI, LOGL_NOTICE, "write failed %d\n", ret);
 }
 
 #define BCHAN_TX_GRAN	160
@@ -395,7 +428,10 @@ static int mi_e1_setup(struct e1inp_line *line, int release_l2)
 			continue;
 			break;
 		case E1INP_TS_TYPE_SIGN:
-			bfd->fd = socket(PF_ISDN, SOCK_DGRAM, ISDN_P_LAPD_NT);
+			if (use_userspace_lapd)
+				bfd->fd = socket(PF_ISDN, SOCK_DGRAM, ISDN_P_B_HDLC);
+			else
+				bfd->fd = socket(PF_ISDN, SOCK_DGRAM, ISDN_P_LAPD_NT);
 			bfd->when = BSC_FD_READ;
 			break;
 		case E1INP_TS_TYPE_TRAU:
@@ -423,6 +459,8 @@ static int mi_e1_setup(struct e1inp_line *line, int release_l2)
 			//addr.sapi = e1inp_ts->sign.sapi;
 			addr.sapi = 0;
 			addr.tei = GROUP_TEI;
+			if (use_userspace_lapd)
+				e1i_ts->lapd = lapd_instance_alloc(1, misdn_write_msg, bfd);
 			break;
 		case E1INP_TS_TYPE_TRAU:
 			addr.channel = ts;
