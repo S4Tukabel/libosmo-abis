@@ -20,6 +20,19 @@
  *
  */
 
+/*! \file misdn.c
+ *  \brief Osmocom A-bis input driver for mISDN
+ *
+ * This driver has two modes of operations, exported via two different
+ * \ref e1_input_driver structures: 
+ * "misdn" is the classic version and it uses the in-kernel LAPD
+ * implementation.  This is somewhat limited in e.g. the fact that
+ * you can only have one E1 timeslot in signaling mode.
+ * "misdn_lapd" is a newer version which uses userspace LAPD code
+ * contained in libosmo-abis.  It offers the same flexibilty as the
+ * DAHDI driver, i.e. any number of signaling slots.
+ */
+
 #include "internal.h"
 
 #include <stdio.h>
@@ -51,8 +64,10 @@
 
 #define TS1_ALLOC_SIZE	300
 
-/* FIXME: find a way to configure this, maybe even per line */
-static int use_userspace_lapd = 0;
+/*! \brief driver-specific data for \ref e1inp_line::driver_data */
+struct misdn_line {
+	int use_userspace_lapd;
+};
 
 const struct value_string prim_names[] = {
 	{ PH_CONTROL_IND, "PH_CONTROL_IND" },
@@ -74,6 +89,7 @@ const struct value_string prim_names[] = {
 static int handle_ts1_read(struct osmo_fd *bfd)
 {
 	struct e1inp_line *line = bfd->data;
+	struct misdn_line *mline = line->driver_data;
 	unsigned int ts_nr = bfd->priv_nr;
 	struct e1inp_ts *e1i_ts = &line->ts[ts_nr-1];
 	struct e1inp_sign_link *link;
@@ -149,7 +165,7 @@ static int handle_ts1_read(struct osmo_fd *bfd)
 	case DL_UNITDATA_IND:
 		msg->l2h = msg->data + MISDN_HEADER_LEN;
 		DEBUGP(DLMI, "RX: %s\n", osmo_hexdump(msgb_l2(msg), ret - MISDN_HEADER_LEN));
-		if (use_userspace_lapd) {
+		if (mline->use_userspace_lapd) {
 			/* remove the Misdn Header */
 			msgb_pull(msg, MISDN_HEADER_LEN);
 			/* hand into the LAPD code */
@@ -195,6 +211,7 @@ static void timeout_ts1_write(void *data)
 static int handle_ts1_write(struct osmo_fd *bfd)
 {
 	struct e1inp_line *line = bfd->data;
+	struct misdn_line *mline = line->driver_data;
 	unsigned int ts_nr = bfd->priv_nr;
 	struct e1inp_ts *e1i_ts = &line->ts[ts_nr-1];
 	struct e1inp_sign_link *sign_link;
@@ -213,7 +230,7 @@ static int handle_ts1_write(struct osmo_fd *bfd)
 		return 0;
 	}
 
-	if (use_userspace_lapd) {
+	if (mline->use_userspace_lapd) {
 		DEBUGP(DLMI, "TX %u/%u/%u: %s\n",
 			line->num, sign_link->tei, sign_link->sapi,
 			osmo_hexdump(msg->data, msg->len));
@@ -400,6 +417,7 @@ static int activate_bchan(struct e1inp_line *line, int ts, int act)
 }
 
 static int mi_e1_line_update(struct e1inp_line *line);
+static int mi_e1_line_update_lapd(struct e1inp_line *line);
 
 struct e1inp_driver misdn_driver = {
 	.name = "misdn",
@@ -408,8 +426,16 @@ struct e1inp_driver misdn_driver = {
 	.line_update = &mi_e1_line_update,
 };
 
+struct e1inp_driver misdn_lapd_driver = {
+	.name = "misdn_lapd",
+	.want_write = ts_want_write,
+	.default_delay = 50000,
+	.line_update = &mi_e1_line_update_lapd,
+};
+
 static int mi_e1_setup(struct e1inp_line *line, int release_l2)
 {
+	struct misdn_line *mline = line->driver_data;
 	int ts, ret;
 
 	/* TS0 is CRC4, don't need any fd for it */
@@ -428,7 +454,7 @@ static int mi_e1_setup(struct e1inp_line *line, int release_l2)
 			continue;
 			break;
 		case E1INP_TS_TYPE_SIGN:
-			if (use_userspace_lapd)
+			if (mline->use_userspace_lapd)
 				bfd->fd = socket(PF_ISDN, SOCK_DGRAM, ISDN_P_B_HDLC);
 			else
 				bfd->fd = socket(PF_ISDN, SOCK_DGRAM, ISDN_P_LAPD_NT);
@@ -459,7 +485,7 @@ static int mi_e1_setup(struct e1inp_line *line, int release_l2)
 			//addr.sapi = e1inp_ts->sign.sapi;
 			addr.sapi = 0;
 			addr.tei = GROUP_TEI;
-			if (use_userspace_lapd)
+			if (mline->use_userspace_lapd)
 				e1i_ts->lapd = lapd_instance_alloc(1, misdn_write_msg, bfd);
 			break;
 		case E1INP_TS_TYPE_TRAU:
@@ -502,7 +528,7 @@ static int mi_e1_setup(struct e1inp_line *line, int release_l2)
 	return 0;
 }
 
-static int mi_e1_line_update(struct e1inp_line *line)
+static int _mi_e1_line_update(struct e1inp_line *line)
 {
 	struct mISDN_devinfo devinfo;
 	int sk, ret, cnt;
@@ -555,8 +581,35 @@ static int mi_e1_line_update(struct e1inp_line *line)
 	return 0;
 }
 
+static int mi_e1_line_update(struct e1inp_line *line)
+{
+	struct misdn_line *ml;
+
+	if (!line->driver_data)
+		line->driver_data = talloc_zero(line, struct misdn_line);
+
+	ml = line->driver_data;
+	ml->use_userspace_lapd = 0;
+
+	return _mi_e1_line_update(line);
+}
+
+static int mi_e1_line_update_lapd(struct e1inp_line *line)
+{
+	struct misdn_line *ml;
+
+	if (!line->driver_data)
+		line->driver_data = talloc_zero(line, struct misdn_line);
+
+	ml = line->driver_data;
+	ml->use_userspace_lapd = 1;
+
+	return _mi_e1_line_update(line);
+}
+
 void e1inp_misdn_init(void)
 {
 	/* register the driver with the core */
 	e1inp_driver_register(&misdn_driver);
+	e1inp_driver_register(&misdn_lapd_driver);
 }
