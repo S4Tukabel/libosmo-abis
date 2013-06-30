@@ -406,7 +406,7 @@ static int hsl_bts_process(struct ipa_client_conn *link, struct msgb *msg)
 	return 0;
 }
 
-static int hsl_bts_connect(struct ipa_client_conn *link)
+static void hsl_bts_updown(struct ipa_client_conn *link, int up)
 {
 	struct msgb *msg;
 	uint8_t *serno;
@@ -414,10 +414,13 @@ static int hsl_bts_connect(struct ipa_client_conn *link)
 	struct hsl_unit *unit = link->line->ops->cfg.ipa.dev;
 	struct e1inp_sign_link *sign_link;
 
+	if (!up)
+		return;
+
 	/* send the minimal message to identify this BTS. */
 	msg = ipa_msg_alloc(0);
 	if (!msg)
-		return -ENOMEM;
+		return;
 
 	*msgb_put(msg, 1) = 0x80;
 	*msgb_put(msg, 1) = 0x80;
@@ -434,7 +437,7 @@ static int hsl_bts_connect(struct ipa_client_conn *link)
 		LOGP(DLINP, LOGL_ERROR,
 			"Unable to set signal link, closing socket.\n");
 		ipa_client_conn_close(link);
-		return -EINVAL;
+		return;
 	}
 	sign_link = link->line->ops->sign_link_up(&unit,
 						  link->line, E1INP_SIGN_NONE);
@@ -442,9 +445,8 @@ static int hsl_bts_connect(struct ipa_client_conn *link)
 		LOGP(DLINP, LOGL_ERROR,
 		     "Unable to set signal link, closing socket.\n");
 		ipa_client_conn_close(link);
-		return -EINVAL;
+		return;
 	}
-	return 0;
 }
 
 struct hsl_line {
@@ -501,7 +503,7 @@ static int hsl_line_update(struct e1inp_line *line)
 					      E1INP_SIGN_OML,
 					      line->ops->cfg.ipa.addr,
 					      HSL_TCP_PORT,
-					      hsl_bts_connect,
+					      hsl_bts_updown,
 					      hsl_bts_process,
 					      hsl_bts_write,
 					      NULL);
